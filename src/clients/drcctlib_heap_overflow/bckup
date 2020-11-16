@@ -50,8 +50,6 @@ static uint tls_offs;
 #    define IF_WINDOWS_ELSE(x, y) y
 #endif
 #define MALLOC_ROUTINE_NAME IF_WINDOWS_ELSE("HeapAlloc", "malloc")
-#define FREE_ROUTINE_NAME IF_WINDOWS_ELSE("Free", "free")
-static uint malloc_oom;
 static size_t max_malloc;
 static void *max_lock;
 typedef struct _mem_ref_t {
@@ -65,51 +63,101 @@ typedef struct _per_thread_t {
     void *cur_buf;
 } per_thread_t;
 //structure to record context handle and rw
+typedef struct _record {
+    bool rw;
+    context_handle_t ctxt_hndl;
+} record;
 
+TlsShadowMemory<record> *last_state;
+std::map<reg_id_t,record> last_acc_reg;
 #define TLS_MEM_REF_BUFF_SIZE 100
-std::map<app_pc, context_handle_t> redmap;
 
-std::map<app_pc, app_pc> freemap;
-std::set<int64_t> ctx_red_malloc;
-int cnt=0;
+std::map<int64_t,int64_t> record_freq_mem;
+std::map<int64_t,int64_t> record_freq_reg;
 // client want to do
 void
-eachMemAccess(void *drcontext, context_handle_t cur_ctxt_hndl, mem_ref_t *ref)
+DetectDeadMem(void *drcontext, context_handle_t cur_ctxt_hndl, mem_ref_t *ref,bool rw)
 {
     // add online analysis here
-
-    size_t instr_size=ref->size;
-    app_pc init_addr=ref->addr;
-    app_pc it;
-    int i=0;
-    for(it=init_addr;it<init_addr+instr_size;it++)
+    int32_t dead_ctxt,killing_ctxt;
+    int64_t temp;
+    record *state=last_state->GetShadowAddress((size_t)ref->addr);
+    if(!state)
+        state=last_state->GetOrCreateShadowAddress((size_t)ref->addr);
+    else
     {
-        std::map<app_pc,context_handle_t>::iterator redzone_it=redmap.find(it);
-        context_handle_t redmat_ctx=redzone_it->second;
-        if(redzone_it!=redmap.end())
-       {
-          // dr_fprintf(gTraceFile)
-          ctx_red_malloc.insert((((int64_t)redmat_ctx)<<32) | (((int64_t)cur_ctxt_hndl)<<32)>>32);
-       } 
+        if(state->rw==true && rw==true)
+        {
+           temp=((((int64_t)state->ctxt_hndl)<<32) | (((int64_t)cur_ctxt_hndl)<<32)>>32);
+           if(record_freq_mem.find(temp)==record_freq_mem.end())
+               record_freq_mem.insert({temp,1});
+           else
+                record_freq_mem[temp]++;
+        }
     }
+    state->rw=rw;
+    state->ctxt_hndl=cur_ctxt_hndl;
 
 }
 // dr clean call Memory
 void
-InsertCleancall(int32_t slot,int32_t num)
+InsertCleancallMem(int32_t slot,int32_t num_read,int32_t num_write)
 {
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     context_handle_t cur_ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
-    for (int i = 0; i < num; i++) {
+    for (int i = 0; i < num_read; i++) {
         if (pt->cur_buf_list[i].addr != 0) {
-            eachMemAccess(drcontext, cur_ctxt_hndl, &pt->cur_buf_list[i]);
+            DetectDeadMem(drcontext, cur_ctxt_hndl, &pt->cur_buf_list[i],false);
         }
     }
 
+    for (int i = num_read; i < num_read+num_write; i++) {
+        if (pt->cur_buf_list[i].addr != 0) {
+            DetectDeadMem(drcontext, cur_ctxt_hndl, &pt->cur_buf_list[i],true);
+        }
+    }
     
     BUF_PTR(pt->cur_buf, mem_ref_t, INSTRACE_TLS_OFFS_BUF_PTR) = pt->cur_buf_list;
     
+}
+//clean call Register
+void
+InsertCleancallReg(int32_t slot, reg_id_t reg_id, int32_t re_w)
+{
+    bool rw;
+    if(re_w==1)
+        rw=true;
+    else
+        rw=false;
+    
+    void *drcontext = dr_get_current_drcontext();
+    per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    context_handle_t cur_ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
+    
+    int64_t temp;
+    int32_t dead_ctxt,killing_ctxt;
+    record rec;
+    rec.rw=rw;
+    rec.ctxt_hndl=cur_ctxt_hndl;
+    if(last_acc_reg.find(reg_id)==last_acc_reg.end())
+        last_acc_reg.insert({reg_id,rec});
+    else
+    {
+        if(last_acc_reg[reg_id].rw==true && rw==true)
+        {
+            temp=((((int64_t)last_acc_reg[reg_id].ctxt_hndl)<<32) | (((int64_t)cur_ctxt_hndl)<<32)>>32);
+            if(record_freq_reg.find(temp)==record_freq_reg.end())
+                record_freq_reg.insert({temp,1});
+            else
+                record_freq_reg[temp]++;
+
+        }
+         
+        last_acc_reg[reg_id].rw=rw;
+        last_acc_reg[reg_id].ctxt_hndl=cur_ctxt_hndl;
+        
+     }
 }
 
 // insert
@@ -178,26 +226,63 @@ void
 InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
 {
 
-
     instrlist_t *bb = instrument_msg->bb;
     instr_t *instr = instrument_msg->instr;
     int32_t slot = instrument_msg->slot;
-    int num = 0;
+    int32_t num_read = 0;
+    int32_t num_write = 0;
+    //get src operand memory ref
     for (int i = 0; i < instr_num_srcs(instr); i++) {
-        if (opnd_is_memory_reference(instr_get_src(instr, i))) {
-            num++;
+        opnd_t op=instr_get_src(instr, i);
+        if (opnd_is_memory_reference(op)) {
+            num_read++;
             InstrumentMem(drcontext, bb, instr, instr_get_src(instr, i));
         }
+
+        int num_temp = opnd_num_regs_used(op);
+        for(int j=0;j<num_temp;j++)
+        {
+            auto reg=opnd_get_reg_used(op,j);
+            dr_insert_clean_call(drcontext, bb, instr,
+                                 (void *)InsertCleancallReg,false, 3,
+                                 OPND_CREATE_CCT_INT(slot), 
+                                 OPND_CREATE_CCT_INT(reg) ,
+                                 OPND_CREATE_CCT_INT(0));
+         } 
     }
     for (int i = 0; i < instr_num_dsts(instr); i++) {
-        if (opnd_is_memory_reference(instr_get_dst(instr, i))) {
-            num++;
+        opnd_t op=instr_get_dst(instr, i);
+
+        if (opnd_is_reg(op))
+        {
+            
+            auto reg= opnd_get_reg(op);
+            dr_insert_clean_call(drcontext, bb, instr,
+                                 (void *)InsertCleancallReg,false, 3,
+                                 OPND_CREATE_CCT_INT(slot), 
+                                 OPND_CREATE_CCT_INT(reg) , 
+                                 OPND_CREATE_CCT_INT(1));
+        }
+        else if (opnd_is_memory_reference(op)) {
+            num_write++;
             InstrumentMem(drcontext, bb, instr, instr_get_dst(instr, i));
+
+            int num_temp = opnd_num_regs_used(op);
+            for(int j=0;j<num_temp;j++)
+            {
+                auto reg=opnd_get_reg_used(op,j);
+                dr_insert_clean_call(drcontext, bb, instr,
+                                     (void *)InsertCleancallReg,false, 3,
+                                     OPND_CREATE_CCT_INT(slot), 
+                                     OPND_CREATE_CCT_INT(reg) , 
+                                     OPND_CREATE_CCT_INT(0));
+            }
         }
     }
-    dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall, false, 2,
-                         OPND_CREATE_CCT_INT(slot), OPND_CREATE_CCT_INT(num));
-
+    dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancallMem, false, 3,
+                         OPND_CREATE_CCT_INT(slot), 
+                         OPND_CREATE_CCT_INT(num_read),
+                         OPND_CREATE_CCT_INT(num_write));
 }
 
 static void
@@ -232,6 +317,7 @@ ClientInit(int argc, const char *argv[])
     char name[MAXIMUM_PATH] = "x86.drcctlib_heap_overflow.out.";
 #endif
 
+    last_state = new TlsShadowMemory<record>();
     gethostname(name + strlen(name), MAXIMUM_PATH - strlen(name));
     pid_t pid = getpid();
     sprintf(name + strlen(name), "%d", pid);
@@ -256,31 +342,82 @@ bool cmp(std::pair<int64_t, int64_t>& a,
 static void
 ClientExit(void)
 {
-   dr_fprintf(gTraceFile,"=====================Heap overflow====================\n\n");
-   context_handle_t malloc_ctx,redzone_ctx;
-   std::set<int64_t>::iterator it;
-   for(it=ctx_red_malloc.begin();it!=ctx_red_malloc.end();it++)
-   {
-       redzone_ctx=(context_handle_t)((int64_t)(*it)>>32);
-       malloc_ctx=(context_handle_t)(((int64_t)(*it)<<32)>>32);
-       dr_fprintf(gTraceFile, "context : %ld and full call path of allocations is below:\n ",malloc_ctx);
-       dr_fprintf(gTraceFile,"==================\n");
-       drcctlib_print_ctxt_hndl_msg(gTraceFile,
-               (context_handle_t)malloc_ctx,
-               false, false);
-       drcctlib_print_full_cct(gTraceFile, (context_handle_t)malloc_ctx, true, false,
-               MAX_CLIENT_CCT_PRINT_DEPTH);
 
-       dr_fprintf(gTraceFile, "context : %ld and full call path of memory loads and stores               is below:\n ",redzone_ctx);
-       dr_fprintf(gTraceFile,"==================\n");
-       drcctlib_print_ctxt_hndl_msg(gTraceFile,
-               (context_handle_t)redzone_ctx,
-               false, false);
-       drcctlib_print_full_cct(gTraceFile, (context_handle_t)redzone_ctx, true, false,
-               MAX_CLIENT_CCT_PRINT_DEPTH);
-   }
+/*    std::map<int64_t,int64_t>::iterator it;
+    std::vector<std::pair<int64_t,int64_t>>::iterator it2;
+    int i=0,i1=0;
+    std::vector<std::pair<int64_t,int64_t>> sort_vec;
+    std::vector<std::pair<int64_t,int64_t>> sort_vec_reg;
 
+    for(it=record_freq_mem.begin();it!=record_freq_mem.end();it++)
+    {
+        sort_vec.push_back({it->first,it->second});
+    }
 
+    dr_fprintf(gTraceFile, "======Printing stats Memory==================\n");
+    std::sort(sort_vec.begin(),sort_vec.end(),cmp);
+    int cnt=0;
+    for(it2=sort_vec.begin();it2!=sort_vec.end();it2++)
+    {   
+
+        int64_t dead_store=it2->first >> 32;
+        int64_t dead_kill = (it2->first <<32) >>32;
+        if(cnt<=100)
+        {
+            dr_fprintf(gTraceFile, "%ld dead store context,"
+                    "%ld dead kill context ,%ld total freq\n",
+                        dead_store,dead_kill,it2->second);
+            dr_fprintf(gTraceFile, "dead store context tree \n");
+            dr_fprintf(gTraceFile,"==================\n");
+            cnt++;    
+     	    drcctlib_print_ctxt_hndl_msg(gTraceFile, 
+                                        (context_handle_t)dead_store, 
+                                        false, false);
+            drcctlib_print_full_cct(gTraceFile, (context_handle_t)dead_store, true, false,
+                        MAX_CLIENT_CCT_PRINT_DEPTH);
+
+                
+            dr_fprintf(gTraceFile, "dead kill context tree \n");
+            dr_fprintf(gTraceFile,"==================\n");
+     	    drcctlib_print_ctxt_hndl_msg(gTraceFile, (context_handle_t)dead_kill, false, false);
+            drcctlib_print_full_cct(gTraceFile, (context_handle_t)dead_kill, true, false,
+                        MAX_CLIENT_CCT_PRINT_DEPTH);
+
+        }
+        else
+            break;
+          
+        dr_fprintf(gTraceFile,"==================\n\n");
+    }
+
+    for(it=record_freq_reg.begin();it!=record_freq_reg.end();it++)
+    {
+        sort_vec_reg.push_back({it->first,it->second});
+    }
+    dr_fprintf(gTraceFile, "======Printing stats Register==================\n");
+    std::sort(sort_vec_reg.begin(),sort_vec_reg.end(),cmp);
+    cnt=0;
+    for(it2=sort_vec_reg.begin();it2!=sort_vec_reg.end();it2++)
+    {   
+
+        int64_t dead_store=it2->first >> 32;
+        int64_t dead_kill = (it2->first <<32) >>32;
+        if(cnt<=100)
+        {
+            dr_fprintf(gTraceFile, "%ld dead store, %ld dead kill ,%ld freq\n",
+                        dead_store,dead_kill,it2->second);
+            cnt++;
+                
+     	        drcctlib_print_ctxt_hndl_msg(gTraceFile, (context_handle_t)dead_store, false, false);
+                drcctlib_print_full_cct(gTraceFile, (context_handle_t)dead_store, true, false,
+                        MAX_CLIENT_CCT_PRINT_DEPTH);
+
+        }
+        else
+            break;
+        dr_fprintf(gTraceFile,"==================\n");
+    }
+    delete(last_state);*/
     drcctlib_exit();
 
     if (!dr_raw_tls_cfree(tls_offs, INSTRACE_TLS_COUNT)) {
@@ -308,57 +445,35 @@ wrap_pre(void *wrapcxt, OUT void **user_data)
     /* malloc(size) or HeapAlloc(heap, flags, size) */
     size_t sz = (size_t)drwrap_get_arg(wrapcxt, IF_WINDOWS_ELSE(2, 0));
     /* increment the allocation size by 1, as red zone */
+    bool set_arg=drwrap_set_arg(wrapcxt,sz,(void *)(sz+1));
 
-    int red_sz=1;
-    bool set_arg=drwrap_set_arg(wrapcxt,IF_WINDOWS_ELSE(2, 0),(void *)(sz+red_sz));
-
-    dr_fprintf(gTraceFile,"Testing pre!!!!!!!!!!%d\n\n",sz);
-    dr_fprintf(gTraceFile,"Post adding %d\n\n",(size_t)drwrap_get_arg(wrapcxt, IF_WINDOWS_ELSE(2, 0)));
+    dr_fprintf(gTraceFile,"Testing pre!!!!!!!!!!\n\n");
+    /* find the maximum malloc request */
+    if (sz > max_malloc) {
+        dr_mutex_lock(max_lock);
+        if (sz > max_malloc)
+            max_malloc = sz;
+        dr_mutex_unlock(max_lock);
+    }
     *user_data = (void *)sz;
 }
-static void
-free_pre(void *wrapcxt, void **user_data)
-{
-    /* free(addr) or HeapAlloc(heap, flags, size) */
-    app_pc B=(app_pc)drwrap_get_retval(wrapcxt);
-    int red_sz=1;
-    std::map<app_pc,app_pc>::iterator it=freemap.find(B);
-    app_pc redstart=it->second;
-    for(int i=0;i<red_sz;i++)
-    {
-        redmap.erase(redstart);
-        redstart++;
-    }
-    freemap.erase(B);
-
-}
-
 
 static void
 wrap_post(void *wrapcxt, void *user_data)
 {
+#ifdef SHOW_RESULTS /* we want determinism in our test suite */
     size_t sz = (size_t)user_data;
-    app_pc B=(app_pc)drwrap_get_retval(wrapcxt); 
-    dr_fprintf(gTraceFile,"Address start= %ld,%d\n\n",B,sz);
-    int red_sz=1;
-    app_pc R=(B+(int)sz);
-    context_handle_t malloc_ctxt_hndl=drcctlib_get_context_handle(
-            drwrap_get_drcontext(wrapcxt), 0);
-    for(int i=0;i<red_sz;i++)
-    {
-        redmap.insert({R,malloc_ctxt_hndl});
-        R++;
+    dr_fprintf(gTraceFile,"Address start= %p\n\n",user_data);
+    DRCCTLIB_PRINTF("Creating log file at:%p", user_data);
+    /* test out-of-memory by having a random moderately-large alloc fail */
+    if (sz > 1024 && dr_get_random_value(1000) < 10) {
+        bool ok = drwrap_set_retval(wrapcxt, NULL);
+        DR_ASSERT(ok);
+        dr_mutex_lock(max_lock);
+        malloc_oom++;
+        dr_mutex_unlock(max_lock);
     }
-    freemap.insert({B,R});
-
-}
-
-
-
-static void
-free_post(void *wrapcxt, void *user_data)
-{
-
+#endif
 }
 
 static void 
@@ -385,30 +500,6 @@ module_load_event(void *drcontext, const module_data_t *mod, bool loaded)
         }
 #endif
     }
-    app_pc freewrap = (app_pc)dr_get_proc_address(mod->handle, FREE_ROUTINE_NAME);
-
-	if (freewrap != NULL) {
-#ifdef SHOW_RESULTS
-        bool ok =
-#endif
-            drwrap_wrap(freewrap, free_pre, free_post);
-#ifdef SHOW_RESULTS
-        if (ok) {
-            dr_fprintf(STDERR, "<wrapped " FREE_ROUTINE_NAME " @" PFX "\n", freewrap);
-        } else {
-            /* We expect this w/ forwarded exports (e.g., on win7 both
-             * kernel32!HeapAlloc and kernelbase!HeapAlloc forward to
-             * the same routine in ntdll.dll)
-             */
-            dr_fprintf(STDERR,
-                       "<FAILED to wrap " FREE_ROUTINE_NAME " @" PFX
-                       ": already wrapped?\n",
-                       freewrap);
-        }
-#endif
-    }
-
-
 }
 
 #ifdef __cplusplus
