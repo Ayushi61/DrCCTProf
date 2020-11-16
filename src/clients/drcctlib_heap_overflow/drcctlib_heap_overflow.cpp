@@ -67,6 +67,7 @@ typedef struct _per_thread_t {
 //structure to record context handle and rw
 
 #define TLS_MEM_REF_BUFF_SIZE 100
+#define RED_SZ 50
 std::map<app_pc, context_handle_t> redmap;
 
 std::map<app_pc, app_pc> freemap;
@@ -85,12 +86,12 @@ eachMemAccess(void *drcontext, context_handle_t cur_ctxt_hndl, mem_ref_t *ref)
     for(it=init_addr;it<init_addr+instr_size;it++)
     {
         std::map<app_pc,context_handle_t>::iterator redzone_it=redmap.find(it);
-        context_handle_t redmat_ctx=redzone_it->second;
         if(redzone_it!=redmap.end())
-       {
-          // dr_fprintf(gTraceFile)
-          ctx_red_malloc.insert((((int64_t)redmat_ctx)<<32) | (((int64_t)cur_ctxt_hndl)<<32)>>32);
-       } 
+        {
+            context_handle_t redmat_ctx=redzone_it->second;
+            // dr_fprintf(gTraceFile)
+            ctx_red_malloc.insert((((int64_t)redmat_ctx)<<32) | (((int64_t)cur_ctxt_hndl)<<32)>>32);
+        } 
     }
 
 }
@@ -263,22 +264,25 @@ ClientExit(void)
    {
        redzone_ctx=(context_handle_t)((int64_t)(*it)>>32);
        malloc_ctx=(context_handle_t)(((int64_t)(*it)<<32)>>32);
-       dr_fprintf(gTraceFile, "context : %ld and full call path of allocations is below:\n ",malloc_ctx);
-       dr_fprintf(gTraceFile,"==================\n");
+       dr_fprintf(gTraceFile, "------------------- full call path of Malloc allocations is below: context:%ld\n ",malloc_ctx);
+       dr_fprintf(gTraceFile,"===================================================\n");
        drcctlib_print_ctxt_hndl_msg(gTraceFile,
                (context_handle_t)malloc_ctx,
                false, false);
        drcctlib_print_full_cct(gTraceFile, (context_handle_t)malloc_ctx, true, false,
                MAX_CLIENT_CCT_PRINT_DEPTH);
 
-       dr_fprintf(gTraceFile, "context : %ld and full call path of memory loads and stores               is below:\n ",redzone_ctx);
-       dr_fprintf(gTraceFile,"==================\n");
+       dr_fprintf(gTraceFile, "------------------full call path of Overflow memory loads and stores is below: conext:%ld\n ",redzone_ctx);
+       dr_fprintf(gTraceFile,"===================================================\n");
        drcctlib_print_ctxt_hndl_msg(gTraceFile,
                (context_handle_t)redzone_ctx,
                false, false);
        drcctlib_print_full_cct(gTraceFile, (context_handle_t)redzone_ctx, true, false,
                MAX_CLIENT_CCT_PRINT_DEPTH);
+
+       dr_fprintf(gTraceFile,"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n");
    }
+   dr_close_file(gTraceFile);
 
 
     drcctlib_exit();
@@ -309,8 +313,7 @@ wrap_pre(void *wrapcxt, OUT void **user_data)
     size_t sz = (size_t)drwrap_get_arg(wrapcxt, IF_WINDOWS_ELSE(2, 0));
     /* increment the allocation size by 1, as red zone */
 
-    int red_sz=1;
-    bool set_arg=drwrap_set_arg(wrapcxt,IF_WINDOWS_ELSE(2, 0),(void *)(sz+red_sz));
+    bool set_arg=drwrap_set_arg(wrapcxt,IF_WINDOWS_ELSE(2, 0),(void *)(sz+(RED_SZ*4)));
 
     dr_fprintf(gTraceFile,"Testing pre!!!!!!!!!!%d\n\n",sz);
     dr_fprintf(gTraceFile,"Post adding %d\n\n",(size_t)drwrap_get_arg(wrapcxt, IF_WINDOWS_ELSE(2, 0)));
@@ -320,16 +323,19 @@ static void
 free_pre(void *wrapcxt, void **user_data)
 {
     /* free(addr) or HeapAlloc(heap, flags, size) */
-    app_pc B=(app_pc)drwrap_get_retval(wrapcxt);
-    int red_sz=1;
+    app_pc B=(app_pc)drwrap_get_arg(wrapcxt,0);
     std::map<app_pc,app_pc>::iterator it=freemap.find(B);
-    app_pc redstart=it->second;
-    for(int i=0;i<red_sz;i++)
+    int limit=RED_SZ*4;
+    if(it!=freemap.end())
     {
-        redmap.erase(redstart);
-        redstart++;
+        app_pc redstart=it->second;
+        for(int i=0;i<limit;i++)
+        {
+            redmap.erase(redstart);
+            redstart++;
+        }
+        freemap.erase(B);
     }
-    freemap.erase(B);
 
 }
 
@@ -339,12 +345,12 @@ wrap_post(void *wrapcxt, void *user_data)
 {
     size_t sz = (size_t)user_data;
     app_pc B=(app_pc)drwrap_get_retval(wrapcxt); 
-    dr_fprintf(gTraceFile,"Address start= %ld,%d\n\n",B,sz);
-    int red_sz=1;
     app_pc R=(B+(int)sz);
     context_handle_t malloc_ctxt_hndl=drcctlib_get_context_handle(
             drwrap_get_drcontext(wrapcxt), 0);
-    for(int i=0;i<red_sz;i++)
+    dr_fprintf(gTraceFile,"Address start= %ld,%d,context= %ld\n\n",B,sz,malloc_ctxt_hndl);
+    int limit=RED_SZ*4;
+    for(int i=0;i<limit;i++)
     {
         redmap.insert({R,malloc_ctxt_hndl});
         R++;
@@ -353,13 +359,6 @@ wrap_post(void *wrapcxt, void *user_data)
 
 }
 
-
-
-static void
-free_post(void *wrapcxt, void *user_data)
-{
-
-}
 
 static void 
 module_load_event(void *drcontext, const module_data_t *mod, bool loaded)
@@ -391,7 +390,7 @@ module_load_event(void *drcontext, const module_data_t *mod, bool loaded)
 #ifdef SHOW_RESULTS
         bool ok =
 #endif
-            drwrap_wrap(freewrap, free_pre, free_post);
+            drwrap_wrap(freewrap, free_pre, NULL);
 #ifdef SHOW_RESULTS
         if (ok) {
             dr_fprintf(STDERR, "<wrapped " FREE_ROUTINE_NAME " @" PFX "\n", freewrap);
